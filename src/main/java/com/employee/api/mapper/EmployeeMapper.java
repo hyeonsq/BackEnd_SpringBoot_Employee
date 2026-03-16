@@ -4,7 +4,7 @@ import com.employee.api.dto.EmployeeDto;
 import com.employee.api.entity.Employee;
 
 public class EmployeeMapper {
-    // Entity -> DTO (ID만 포함)
+    // Entity -> DTO (Employee ( Department의 Id만 포함) )
     public static EmployeeDto mapToEmployeeDto(Employee employee){
         return EmployeeDto.builder()
                 .id(employee.getId())
