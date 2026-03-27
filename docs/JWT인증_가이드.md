@@ -1,8 +1,5 @@
 # JWT 인증 구현 가이드
 
-> `net.restapi.emp.security` 패키지의 모든 클래스를 중심으로
-> JWT 인증/인가의 전체 흐름을 이해하기 쉽게 정리한 문서입니다.
-
 ---
 
 ## 1. JWT란 무엇인가
@@ -327,8 +324,12 @@ Authorization 헤더 확인
             │
             ▼
         토큰에서 이메일 추출 시도
-            ├─ 실패 (만료/위변조/형식오류)
-            │       → 401 JSON 즉시 반환, 필터 체인 중단
+            ├─ 실패 (만료/위변조/형식오류) → JwtException 발생
+            │       │
+            │       ▼
+            │   HandlerExceptionResolver.resolveException()
+            │       └─ DefaultExceptionAdvice.handleJwtException()
+            │               → 401 JSON 반환, 필터 체인 중단
             │
             └─ 성공 → username = "admin@aa.com"
                     │
@@ -349,6 +350,27 @@ Authorization 헤더 확인
                             ▼
                         다음 필터 → 컨트롤러 → @PreAuthorize 검사
 ```
+
+#### HandlerExceptionResolver 위임 방식
+
+필터는 `DispatcherServlet` 바깥에서 실행되므로 단순 `throw`로는 `@RestControllerAdvice`에 도달할 수 없습니다.
+
+```
+단순 throw e (❌)
+  필터 → 서블릿 컨테이너 → /error 엔드포인트 → @RestControllerAdvice 통과 안 함
+
+HandlerExceptionResolver 위임 (✅)
+  필터 → exceptionResolver.resolveException() → @RestControllerAdvice
+```
+
+```java
+// 필터 내부 — JwtException 발생 시
+exceptionResolver.resolveException(request, response, null, e);
+return;  // 필터 체인 중단
+```
+
+`@Qualifier("handlerExceptionResolver")` — Spring이 등록한 복합 리졸버를 명시적으로 지정합니다.
+이 안에 `ExceptionHandlerExceptionResolver`가 포함되어 있어 `@RestControllerAdvice`까지 연결됩니다.
 
 ---
 
@@ -372,50 +394,50 @@ HTTP 요청에 대한 보안 규칙을 체인 방식으로 설정합니다.
 
 ```java
 return http
-    .csrf(csrf -> csrf.disable())
-    // ① CSRF 비활성화
-    //    - CSRF는 브라우저 쿠키/세션 기반 공격 방어
-    //    - JWT는 쿠키/세션을 사용하지 않으므로 불필요
+        .csrf(csrf -> csrf.disable())
+        // ① CSRF 비활성화
+        //    - CSRF는 브라우저 쿠키/세션 기반 공격 방어
+        //    - JWT는 쿠키/세션을 사용하지 않으므로 불필요
 
-    .cors(Customizer.withDefaults())
-    // ② CORS 활성화
-    //    - React(3000) → Spring Boot(8080) 크로스 도메인 요청 허용
-    //    - CorsConfigurationSource 빈(CorsConfig)을 자동 참조
+        .cors(Customizer.withDefaults())
+        // ② CORS 활성화
+        //    - React(3000) → Spring Boot(8080) 크로스 도메인 요청 허용
+        //    - CorsConfigurationSource 빈(CorsConfig)을 자동 참조
 
-    .authorizeHttpRequests(auth -> {
+        .authorizeHttpRequests(auth -> {
         auth.requestMatchers(
             "/api/employees/welcome",
-            "/userinfos/new",
-            "/userinfos/login"
-        ).permitAll()
-        // ③ 공개 경로: 토큰 없이 접근 가능
-        //    - 로그인, 회원가입은 당연히 토큰이 없어야 함
+                    "/userinfos/new",
+                    "/userinfos/login"
+).permitAll()
+// ③ 공개 경로: 토큰 없이 접근 가능
+//    - 로그인, 회원가입은 당연히 토큰이 없어야 함
 
         .requestMatchers("/api/**").authenticated();
-        // ④ 보호 경로: 토큰 있어야 접근 가능
-        //    - /api/employees, /api/departments 등
-        //    - 추가 권한(ROLE_ADMIN 등)은 @PreAuthorize에서 검사
+// ④ 보호 경로: 토큰 있어야 접근 가능
+//    - /api/employees, /api/departments 등
+//    - 추가 권한(ROLE_ADMIN 등)은 @PreAuthorize에서 검사
     })
 
-    .sessionManagement(session ->
+            .sessionManagement(session ->
         session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-    // ⑤ 세션 정책: STATELESS
-    //    - 서버에 세션을 저장하지 않음
-    //    - JWT 토큰만으로 인증 → 수평 확장에 유리
+        // ⑤ 세션 정책: STATELESS
+        //    - 서버에 세션을 저장하지 않음
+        //    - JWT 토큰만으로 인증 → 수평 확장에 유리
 
-    .exceptionHandling(ex -> ex
+        .exceptionHandling(ex -> ex
         .authenticationEntryPoint(...)    // ⑥ 401 처리
         .accessDeniedHandler(...)         // ⑦ 403 처리
     )
 
-    .authenticationProvider(authenticationProvider())
-    // ⑧ DaoAuthenticationProvider 등록
-    //    - 로그인 시 DB에서 사용자 조회 + 비밀번호 검증
+            .authenticationProvider(authenticationProvider())
+        // ⑧ DaoAuthenticationProvider 등록
+        //    - 로그인 시 DB에서 사용자 조회 + 비밀번호 검증
 
-    .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
-    // ⑨ JWT 필터 삽입
-    //    - Spring의 기본 폼 로그인 필터보다 먼저 실행
-    //    - 토큰이 있으면 SecurityContext에 인증 정보를 미리 등록
+        .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
+// ⑨ JWT 필터 삽입
+//    - Spring의 기본 폼 로그인 필터보다 먼저 실행
+//    - 토큰이 있으면 SecurityContext에 인증 정보를 미리 등록
 
     .build();
 ```
@@ -552,7 +574,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
 | 키 생성 방식 | `SECRET.getBytes()` (잘못된 방식) | `Decoders.BASE64.decode()` (올바른 방식) |
 | 만료 시간 위치 | 코드에 하드코딩 | `application.properties` + `@Value` 주입 |
 | 의존성 주입 방식 | `@Autowired` 필드 주입 | `@RequiredArgsConstructor` 생성자 주입 |
-| 토큰 파싱 예외 처리 | 예외 전파 → 500 | try-catch → 401 JSON 반환 |
+| 토큰 파싱 예외 처리 | 예외 전파 → 500 | `HandlerExceptionResolver` 위임 → `DefaultExceptionAdvice` → 401 |
 | 권한 로그 레벨 | `log.info` (매 요청 출력) | `log.debug` (필요 시만 확인) |
 | 세션 정책 | 미설정 | `SessionCreationPolicy.STATELESS` |
 | 반환 타입 | `Boolean` (래퍼) | `boolean` (프리미티브) |
@@ -632,12 +654,12 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbi5...
 
 ### 7-1. 에러 응답 형식
 
-**표준 에러 (DefaultExceptionAdvice)**
+**표준 에러 (DefaultExceptionAdvice)** — JWT 예외 포함 모두 이 형식으로 통일
 ```json
-{ "statusCode": 401, "message": "...", "timestamp": "2026-03-26 10:00:00 목 오전" }
+{ "statusCode": 401, "message": "..." }
 ```
 
-**필터 레벨 에러 (JwtAuthenticationFilter / SecurityConfig)**
+**필터를 통과하지 못한 에러 (SecurityConfig entryPoint/accessDeniedHandler)**
 ```json
 { "error": "Unauthorized", "message": "..." }
 ```
@@ -645,14 +667,15 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbi5...
 ### 7-2. 401 / 403 처리 경로
 
 ```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- 상황                          처리 위치                      상태
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- 만료/위변조 토큰               JwtAuthenticationFilter        401
- 토큰 없이 보호 경로 접근       SecurityConfig entryPoint      401
- 로그인 자격증명 오류           DefaultExceptionAdvice         401
- @PreAuthorize 권한 부족        DefaultExceptionAdvice         403
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 상황                          처리 위치                              상태
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 만료/위변조 토큰               Filter → HandlerExceptionResolver
+                               → DefaultExceptionAdvice(JwtException)    401
+ 토큰 없이 보호 경로 접근       SecurityConfig authenticationEntryPoint   401
+ 로그인 자격증명 오류           DefaultExceptionAdvice(AuthenticationEx)  401
+ @PreAuthorize 권한 부족        DefaultExceptionAdvice(AccessDeniedEx)   403
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
 ### 7-3. DefaultExceptionAdvice 핸들러 우선순위
@@ -662,12 +685,25 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbi5...
 | 1 | `ResourceNotFoundException` | 417/404 | 리소스 없음 |
 | 2 | `HttpMessageNotReadableException` | 400 | 잘못된 요청 바디 |
 | 3 | `MethodArgumentNotValidException` | 400 | 입력값 검증 실패 |
-| 4 | `AuthenticationException` | **401** | 인증 실패 |
-| 5 | `AccessDeniedException` | **403** | 권한 부족 |
-| 6 | `RuntimeException` | 500 | 그 외 예외 |
+| 4 | `JwtException` | **401** | 토큰 만료/위변조/형식오류 (필터에서 위임) |
+| 5 | `AuthenticationException` | **401** | 로그인 자격증명 오류 |
+| 6 | `AccessDeniedException` | **403** | 권한 부족 |
+| 7 | `RuntimeException` | 500 | 그 외 예외 |
 
 > `@ExceptionHandler`는 **가장 구체적인 타입**을 우선 매칭합니다.
-> `AccessDeniedException` 전용 핸들러가 없으면 `RuntimeException` 핸들러가 처리하여 500이 반환됩니다.
+> `JwtException`은 `RuntimeException`을 상속하지만, 전용 핸들러가 있으므로 500이 아닌 401로 처리됩니다.
+
+#### JwtException 계층 구조
+
+```
+JwtException (RuntimeException)
+├── ExpiredJwtException      — 토큰 만료 (exp 시간 초과)
+├── MalformedJwtException    — 형식 오류 (Header.Payload.Signature 구조 불일치)
+├── SignatureException        — 서명 불일치 (시크릿 키 다름)
+└── UnsupportedJwtException  — 미지원 형식
+```
+
+모두 `JwtException` 핸들러 하나로 처리됩니다.
 
 ---
 
@@ -718,12 +754,12 @@ FilterRegistrationBean CorsFilter (order: 0)
 **핵심 허용 설정:**
 ```java
 configuration.setAllowedHeaders(Arrays.asList(
-    "Origin", "Content-Type", "Accept",
-    "Authorization"    // JWT Bearer 토큰 전송에 반드시 필요
+        "Origin", "Content-Type", "Accept",
+                                        "Authorization"    // JWT Bearer 토큰 전송에 반드시 필요
 ));
-configuration.setAllowedMethods(Arrays.asList(
-    "GET", "POST", "PUT", "DELETE", "PATCH",
-    "OPTIONS"          // preflight 요청 처리에 반드시 필요
+        configuration.setAllowedMethods(Arrays.asList(
+        "GET", "POST", "PUT", "DELETE", "PATCH",
+                                                "OPTIONS"          // preflight 요청 처리에 반드시 필요
 ));
 ```
 
